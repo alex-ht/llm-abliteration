@@ -129,6 +129,150 @@ def format_chats(
     ]
     return result_formatted
 
+# ============================================================
+# Static conversation support (good/bad JSONL with full messages)
+# ============================================================
+
+def load_conversations(jsonl_path: str):
+    """Stream conversations from a JSONL file. Each line = list of messages."""
+    import json
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                messages = json.loads(line)
+                if isinstance(messages, list) and len(messages) > 0:
+                    yield messages
+            except Exception:
+                continue
+
+
+def get_assistant_end_positions(tokenizer, messages: list[dict]) -> list[int]:
+    """
+    Return the token indices (in the full conversation) of the last token
+    of each assistant reply. We build the template incrementally for accuracy.
+    """
+    positions = []
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "assistant":
+            convo_so_far = messages[: i + 1]
+            input_ids = tokenizer.apply_chat_template(
+                convo_so_far,
+                tokenize=True,
+                add_generation_prompt=False,
+            )
+            if isinstance(input_ids, list) and len(input_ids) > 0:
+                positions.append(len(input_ids) - 1)
+    return positions
+
+
+def compute_means_from_conversations(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
+    conversations: list[list[dict]],
+    desc: str,
+    dialogue_batch_size: int = 4,
+    max_length: int | None = None,
+    clip: float = 1.0,
+) -> dict[int, torch.Tensor]:
+    """
+    Memory-efficient extraction of per-layer means from full conversations.
+    - Processes conversations in small groups (dialogue_batch_size).
+    - Drops any conversation whose tokenized length > max_length.
+    - Only updates running Welford means at the last token of each assistant turn.
+    - Aggressively clears memory after each micro-batch.
+    """
+    from utils.clip import magnitude_clip
+
+    layer_base = model.model
+    if hasattr(layer_base, "language_model"):
+        layer_base = layer_base.language_model
+    num_layers = len(layer_base.layers)
+
+    means = {layer_idx: None for layer_idx in range(num_layers)}
+    counts = {layer_idx: 0 for layer_idx in range(num_layers)}
+
+    for start_idx in tqdm(range(0, len(conversations), dialogue_batch_size), desc=desc):
+        batch = conversations[start_idx : start_idx + dialogue_batch_size]
+
+        prepared = []  # (input_ids_list, assistant_positions)
+        for convo in batch:
+            try:
+                input_ids = tokenizer.apply_chat_template(
+                    convo, tokenize=True, add_generation_prompt=False
+                )
+                if not isinstance(input_ids, list):
+                    continue
+                if max_length is not None and len(input_ids) > max_length:
+                    continue  # drop entire conversation (user requirement)
+                positions = get_assistant_end_positions(tokenizer, convo)
+                if positions:
+                    prepared.append((input_ids, positions))
+            except Exception:
+                continue
+
+        if not prepared:
+            continue
+
+        # Left-pad the batch for causal LM forward
+        max_len = max(len(ids) for ids, _ in prepared)
+        batch_input = []
+        batch_mask = []
+        adjusted_pos_lists = []
+
+        for ids, positions in prepared:
+            pad_len = max_len - len(ids)
+            padded = [tokenizer.pad_token_id] * pad_len + ids
+            mask = [0] * pad_len + [1] * len(ids)
+            batch_input.append(padded)
+            batch_mask.append(mask)
+            adjusted_pos_lists.append([p + pad_len for p in positions])
+
+        input_tensor = torch.tensor(batch_input, dtype=torch.long, device=model.device)
+        mask_tensor = torch.tensor(batch_mask, dtype=torch.long, device=model.device)
+
+        with torch.no_grad():
+            outputs = model(
+                input_ids=input_tensor,
+                attention_mask=mask_tensor,
+                output_hidden_states=True,
+            )
+            hidden_states = outputs.hidden_states  # (embed, layer0, layer1, ..., layerN)
+
+        # Update means only at the desired positions
+        for sidx, pos_list in enumerate(adjusted_pos_lists):
+            for pos in pos_list:
+                for layer_idx in range(num_layers):
+                    # hidden_states[0] = after embedding
+                    # hidden_states[layer_idx + 1] = after transformer layer layer_idx
+                    hs = hidden_states[layer_idx + 1] if len(hidden_states) > num_layers else hidden_states[layer_idx]
+                    vec = hs[sidx, pos, :].float()
+
+                    if clip < 1.0:
+                        vec = magnitude_clip(vec, clip)
+
+                    total = counts[layer_idx] + 1
+                    if means[layer_idx] is None:
+                        means[layer_idx] = vec
+                    else:
+                        delta = vec - means[layer_idx]
+                        means[layer_idx] += delta / total
+                    counts[layer_idx] = total
+
+        # Aggressive cleanup
+        del outputs, hidden_states, input_tensor, mask_tensor
+        torch.cuda.empty_cache()
+
+    # Return on CPU
+    return {
+        layer_idx: mean.to("cpu")
+        for layer_idx, mean in means.items()
+        if mean is not None
+    }
+
+
 def compute_refusals(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
@@ -192,14 +336,74 @@ def compute_refusals(
     gc.collect()
     return results
 
+
+def compute_refusal_directions_from_static_means(
+    harmful_means: dict,
+    harmless_means: dict,
+    projected: bool = False,
+) -> dict:
+    """
+    Pure static/offline version of refusal direction computation.
+    Does NOT require a model or any inference. Only vector math on pre-computed means.
+
+    This is the core of the new "static data training" path.
+    You can pre-extract means once (expensive), then cheaply experiment with different
+    projection settings, different layer combinations, etc.
+    """
+    results = {}
+    # Try to recover num_layers
+    if "layers" in harmful_means:
+        num_layers = harmful_means["layers"]
+    else:
+        # Infer from keys like harmful_0, harmful_1, ...
+        num_layers = max(
+            (int(k.split("_", 1)[1]) for k in harmful_means.keys() if k.startswith("harmful_")),
+            default=0
+        ) + 1
+
+    results["layers"] = num_layers
+    results["source"] = "static"
+
+    focus_layers = range(num_layers)
+
+    for layer in tqdm(focus_layers, desc="Computing refusal directions from static means"):
+        h_key = f"harmful_{layer}"
+        hl_key = f"harmless_{layer}"
+
+        if h_key not in harmful_means or hl_key not in harmless_means:
+            print(f"Warning: missing means for layer {layer}, skipping.")
+            continue
+
+        harmful_mean = harmful_means[h_key]
+        harmless_mean = harmless_means[hl_key]
+
+        # keep as float32 for numerical stability
+        refusal_dir = (harmful_mean.float() - harmless_mean.float())
+
+        if projected:
+            harmless_normalized = torch.nn.functional.normalize(harmless_mean.float(), dim=0)
+            projection_scalar = refusal_dir @ harmless_normalized
+            refusal_dir = refusal_dir - projection_scalar * harmless_normalized
+
+        results[f"harmful_{layer}"] = harmful_mean
+        results[f"harmless_{layer}"] = harmless_mean
+        results[f"refuse_{layer}"] = refusal_dir
+
+    return results
+
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Measure models for analysis and abliteration")
+    parser = ArgumentParser(
+        description="Measure models for analysis and abliteration. "
+                    "Supports both live inference (default) and static/offline mode using pre-computed activations "
+                    "(see --static-harmful-means / --static-harmless-means on the feature/static-activations branch)."
+    )
     parser.add_argument(
         "--model", "-m",
         type=str,
         default=None,
-        required=True,
-        help="Local model directory or HuggingFace model ID",
+        # Not always required: when using --static-*-means we can work purely from pre-computed activations
+        required=False,
+        help="Local model directory or HuggingFace model ID (not needed in --static-* mode)",
     )
     parser.add_argument(
         "--quant-measure", "-q",
@@ -258,14 +462,80 @@ if __name__ == "__main__":
         help="Remove projection along harmless direction from refusal direction",
     )
 
-    args = parser.parse_args()
-
-    assert (
-        isinstance(args.model, str)
-        and
-        isinstance(args.output, str)
+    # --- Static / offline activation support (new feature on this branch) ---
+    parser.add_argument(
+        "--static-harmful-means",
+        type=str,
+        default=None,
+        help="Path to a previous .refuse / .pt file containing pre-computed 'harmful_*' layer means. "
+             "When provided together with --static-harmless-means, no model will be loaded and no inference is performed.",
+    )
+    parser.add_argument(
+        "--static-harmless-means",
+        type=str,
+        default=None,
+        help="Path to a previous .refuse / .pt file containing pre-computed 'harmless_*' layer means.",
     )
 
+    # New static conversation mode using full message JSONL (good vs bad behavior)
+    parser.add_argument(
+        "--good-jsonl",
+        type=str,
+        default=None,
+        help="Path to JSONL file containing good (desired) conversations in messages format. "
+             "Each line should be a JSON array of {'role': ..., 'content': ...}. "
+             "Used as the 'harmless' side in static mode.",
+    )
+    parser.add_argument(
+        "--bad-jsonl",
+        type=str,
+        default=None,
+        help="Path to JSONL file containing bad (refusing / undesired) conversations in messages format. "
+             "Each line should be a JSON array of {'role': ..., 'content': ...}. "
+             "Used as the 'harmful' side in static mode.",
+    )
+
+    args = parser.parse_args()
+
+    # In pure static-means mode we don't need the model arg
+    using_static_means = bool(args.static_harmful_means and args.static_harmless_means)
+    using_static_conversations = bool(args.good_jsonl and args.bad_jsonl)
+
+    if not (using_static_means or using_static_conversations):
+        assert isinstance(args.model, str), "--model is required for live or conversation-static mode"
+    assert isinstance(args.output, str), "--output is always required"
+
+    # ============================================================
+    # Static / offline paths (feature/static-activations branch)
+    # ============================================================
+    if using_static_conversations:
+        print("=== STATIC CONVERSATIONS MODE (good-jsonl vs bad-jsonl, forward only) ===")
+        print(f"Good (desired) conversations: {args.good_jsonl}")
+        print(f"Bad (refusing) conversations : {args.bad_jsonl}")
+
+        # We still need the model to run forward on the dialogues
+        # (but we will load it later in the normal flow or here)
+        # For now we let the normal model loading happen below, then branch.
+
+    elif using_static_means:
+        print("=== STATIC MEANS MODE (no model, no inference) ===")
+        print(f"Loading pre-computed harmful means from: {args.static_harmful_means}")
+        print(f"Loading pre-computed harmless means from: {args.static_harmless_means}")
+
+        harmful_means = torch.load(args.static_harmful_means, map_location="cpu")
+        harmless_means = torch.load(args.static_harmless_means, map_location="cpu")
+
+        results = compute_refusal_directions_from_static_means(
+            harmful_means, harmless_means, args.projected
+        )
+
+        print(f"Saving refusal information (static) to {args.output}...")
+        torch.save(results, args.output)
+        print("Done.")
+        import sys
+        sys.exit(0)
+
+    # --- Live inference path continues below ---
     torch.inference_mode()
     torch.set_grad_enabled(False)
 
@@ -408,6 +678,51 @@ if __name__ == "__main__":
             device_map="cuda",
             padding=True,
         )
+
+    # --- Static conversations path (good/bad full dialogues) ---
+    if args.good_jsonl and args.bad_jsonl:
+        print("Loading conversations from JSONL (streaming)...")
+        good_convos = list(load_conversations(args.good_jsonl))
+        bad_convos = list(load_conversations(args.bad_jsonl))
+        print(f"Loaded {len(good_convos)} good conversations, {len(bad_convos)} bad conversations.")
+
+        # Ensure we can pad (needed when dialogue_batch_size > 1)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.padding_side = "left"
+
+        # In this mode:
+        #   bad  = harmful side (undesired / refusing behavior)
+        #   good = harmless side (desired behavior)
+        harmful_means = compute_means_from_conversations(
+            model, tokenizer, bad_convos,
+            desc="Extracting means from BAD conversations",
+            dialogue_batch_size=args.batch_size,
+            max_length=getattr(model.config, "max_position_embeddings", None),
+            clip=args.clip,
+        )
+        torch.cuda.empty_cache()
+
+        harmless_means = compute_means_from_conversations(
+            model, tokenizer, good_convos,
+            desc="Extracting means from GOOD conversations",
+            dialogue_batch_size=args.batch_size,
+            max_length=getattr(model.config, "max_position_embeddings", None),
+            clip=args.clip,
+        )
+        torch.cuda.empty_cache()
+
+        results = compute_refusal_directions_from_static_means(
+            harmful_means, harmless_means, args.projected
+        )
+        results["source"] = "static-conversations"
+        results["good_jsonl"] = args.good_jsonl
+        results["bad_jsonl"] = args.bad_jsonl
+
+        print(f"Saving refusal information to {args.output}...")
+        torch.save(results, args.output)
+        import sys
+        sys.exit(0)
 
     print("Computing refusal information...")
     results = {}
