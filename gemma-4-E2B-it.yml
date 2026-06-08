@@ -1,0 +1,142 @@
+# Example ablation config for google/gemma-4-E2B-it
+# Total text layers: 35, hidden_size: 1536
+#
+# 1. First run measurement (user created gemma4-e2b-new.refuse):
+#    python measure.py -m google/gemma-4-E2B-it -o gemma4-e2b-new.refuse --batch-size 8 --projected
+#
+# 2. Analyze (this REFUSE.txt is from gemma4-e2b-new.refuse):
+#    python analyze.py gemma4-e2b-new.refuse -c > REFUSE.txt 2>&1
+#    (Key: highest Est. Signal quality at meas layer 13)
+#
+# 3. Edit this file: adjust which "measurement" layer to use for which target "layer",
+#    and how many layers to ablate. Typical for small models: mid layers as source.
+#    (See REFUSE.txt for the full per-layer Est. Signal quality, cos_sim, SNR etc.)
+#
+# 4. Run (recommended flags for norm-preserving + projected variant):
+#    python sharded_ablate.py gemma-4-E2B-it.yml --normpreserve --projected
+#
+# 5. Test the output dir with chat.py or your own script. If still too much refusal, try
+#    increasing some scales to 1.1-1.3 or adding more target layers. If capability drops too much,
+#    reduce scales to 0.7-0.9 or remove some late layers.
+#
+# Notes:
+# - We only modify layers under model.language_model (vision/audio towers are left untouched).
+# - For VLMs, measurement uses text chat templates only (pure text harmful/harmless data).
+# - Output will be a full copy of the model dir with modified weights.
+
+model: google/gemma-4-E2B-it
+measurements: gemma4-e2b-new.refuse
+output: gemma4-e2b-new-abliterated
+
+ablate:
+  # Tuned based on latest REFUSE.txt (from gemma4-e2b-new.refuse)
+  # Key insights (35 layers, hidden=1536):
+  # - Highest Est. Signal quality by far: Layer 13 (0.5866), cos=0.3689 (excellent), snr=0.9295, ref_norm=40.6
+  # - Very strong: Layer 14 (0.4801)
+  # - Good cluster before peak: Layer 11 (0.3019), Layer 12 (0.3246)
+  # - Secondary cluster: Layer 24 (0.1903 highest in group), Layer 20 (0.1754), Layer 21 (0.1668), Layer 26 (0.1412)
+  # - Very early (<10) and very late (>27): signal quality drops sharply (high cos_sim again)
+  # Strategy (modeled after gemma3-12b-it.yml):
+  #   - Use the absolute best measurement source (13) for the main mid-block targets.
+  #   - Use the best secondary source from the later cluster (24) for later targets.
+  # Recommend: python sharded_ablate.py gemma-4-E2B-it.yml --normpreserve --projected
+
+  # Main peak block — use strongest source (meas 13) for targets around and after the peak
+  - layer: 8
+    measurement: 13
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 9
+    measurement: 13
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 10
+    measurement: 13
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 11
+    measurement: 13
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 12
+    measurement: 13
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 13
+    measurement: 13
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 14
+    measurement: 13
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 15
+    measurement: 13
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 16
+    measurement: 13
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 17
+    measurement: 13
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 18
+    measurement: 13
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 19
+    measurement: 13
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 20
+    measurement: 13
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 21
+    measurement: 13
+    scale: 1.0
+    sparsity: 0.0
+
+  # Later block — switch to best source from the secondary cluster (meas 24)
+  - layer: 22
+    measurement: 24
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 23
+    measurement: 24
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 24
+    measurement: 24
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 25
+    measurement: 24
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 26
+    measurement: 24
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 27
+    measurement: 24
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 28
+    measurement: 24
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 29
+    measurement: 24
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 30
+    measurement: 24
+    scale: 1.0
+    sparsity: 0.0
+  - layer: 31
+    measurement: 24
+    scale: 1.0
+    sparsity: 0.0

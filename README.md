@@ -6,7 +6,7 @@ Make abliterated models using Transformers, easy and fast. Now faster with batch
 
 There exist directions that cause LLMs to refuse users' input. Abliteration is a technique that can approximate the most significant refusal direction by contrasting harmful and harmless prompts, and then remove/ablate the direction from the model. This is a proof-of-concept implementation to explore the removal refusals from an LLM without the use of TransformerLens, although some GPU acceleration has been implemented.
 
-The code in various forms has been tested on Llama-3.2, Qwen2.5-Coder, Ministral-8b, Mistral-7B-Instruct-v0.2, gemma-3-27b-it, and Mistral-Nemo-Instruct-2407.
+The code in various forms has been tested on Llama-3.2, Qwen2.5-Coder, Ministral-8b, Mistral-7B-Instruct-v0.2, gemma-3-12b-it, gemma-3-27b-it, Mistral-Nemo-Instruct-2407, and smaller Gemma models (e.g. 2B/4B class via single-file safetensors support).
 
 VRAM/RAM requirements: This codebase reflects efforts to reduce VRAM usage. You can abliterate whatever any model provided it fits within VRAM. Loading model in 4-bit precision using bitsandbytes is possible and recommended for large models when VRAM is limited. It is assumed that there is enough cpu memory to load the **bf16** (or full weight) model; the method for ablating the refusal vector could be enhanced to perform lazy-loading in the future to reduce this requirement.
 
@@ -16,6 +16,8 @@ CUDA is assumed to be available. The original abliteration paper and code used T
 > Abliteration does not guarantee full removal of censorship. Abliteration doesn't necessarily mean the model is completely uncensored; a properly abliterated model will not explicitly refuse, theoretically, based on the nature of refusals captured in datasets used for abliteration.
 
 For an explanation of abliteration, see: https://huggingface.co/blog/mlabonne/abliteration
+
+**Detailed technical explanation of this codebase (in Chinese)**: see [EXPLANATION.md](./EXPLANATION.md).
 
 This repo enables norm-preserving biprojected abliteration. https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
 
@@ -77,6 +79,8 @@ python sharded_ablate.py <abliteration_yaml_file>
 Look at the example YAML file to see how this is structured.
 YAML was opted for in order to allow more than one source layer for refusal direction measurement, and for different strategies to be applied per destination layer.
 
+The ablation script supports both **sharded** models (large models split across multiple `model-*.safetensors` + `model.safetensors.index.json`) and **single-file** `model.safetensors` (typical for small models such as gemma-2-2b-it or gemma-3-4b-it). It only loads the necessary shards/files.
+
 To orthogonalize the refusal direction against the harmless direction during measurement, specify `--projected`; otherwise the result will correspond to conventional abliteration.
 
 To preserve weight norms/magnitudes during ablation, specify `--normpreserve`; otherwise the result will correspond to conventional abliteration.
@@ -96,6 +100,17 @@ python compare.py -a <model_a> -b <model_b>
 Inherited code that is in need of an update to remain useful.
 
 ## Advanced Usage
+
+### Gemma-4 models (google/gemma-4-E2B-it and similar)
+
+`google/gemma-4-E2B-it` (and E4B) are single-file `model.safetensors` multimodal models (vision + audio towers + language_model). The code now:
+- Correctly picks the `model.language_model` prefix (ignores towers for abliteration).
+- Uses `AutoModelForImageTextToText` + falls back gracefully if `torchvision` etc. missing for processor (text-only measurement still works).
+- Added `gemma4` to tied-weights detection.
+
+Use `--batch-size 8` or `16` for measurement. Only the 35 language_model layers are ablated.
+
+Example YAML for a 2B-class model might target fewer layers and use a measurement source from middle layers (analyze the output of `analyze.py` to choose).
 
 ### Use your own prompts
 

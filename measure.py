@@ -273,11 +273,11 @@ if __name__ == "__main__":
     model_config = AutoConfig.from_pretrained(model)
     model_type = getattr(model_config,"model_type")
 
-    # Get the precision/dtype from config, with proper fallback
-    if hasattr(model_config, "torch_dtype") and model_config.torch_dtype is not None:
-        precision = model_config.torch_dtype
-    elif hasattr(model_config, "dtype") and model_config.dtype is not None:
+    # Get the precision/dtype from config, with proper fallback (prefer modern "dtype")
+    if hasattr(model_config, "dtype") and model_config.dtype is not None:
         precision = model_config.dtype
+    elif hasattr(model_config, "torch_dtype") and model_config.torch_dtype is not None:
+        precision = model_config.torch_dtype
     else:
         # Fallback to bfloat16 if available, otherwise float16
         precision = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -295,10 +295,15 @@ if __name__ == "__main__":
         precision = dtype_map.get(precision, torch.bfloat16)
 
     has_vision = False
-    if hasattr(model_config,"vision_config"):
+    if hasattr(model_config, "vision_config") and getattr(model_config, "vision_config", None):
+        has_vision = True
+    # Also detect multimodal conditional generation models (e.g. Gemma4ForConditionalGeneration, gemma-4 series)
+    archs = getattr(model_config, "architectures", []) or []
+    model_type = getattr(model_config, "model_type", "") or ""
+    if any("ConditionalGeneration" in str(a) for a in archs) or "gemma4" in str(model_type).lower():
         has_vision = True
     model_loader = AutoModelForCausalLM
-    if (has_vision):
+    if has_vision:
         model_loader = AutoModelForImageTextToText
 
     quant_config = None
@@ -348,7 +353,8 @@ if __name__ == "__main__":
 
     # Assume "cuda" device for now; refactor later if there's demand for other GPU-accelerated platforms
     if hasattr(model_config, "quantization_config"):
-        model = AutoModelForCausalLM.from_pretrained(
+        # Use the chosen loader (may be VLM for gemma-4 etc.) even for pre-quantized models
+        model = model_loader.from_pretrained(
             args.model,
 #            trust_remote_code=True,
             dtype=precision,

@@ -20,8 +20,9 @@ def has_tied_weights(model_type: str) -> bool:
     # 'gemma': Original Gemma 1
     # 'gemma2': Gemma 2 models
     # 'gemma3': Gemma 3 models
+    # 'gemma4': Gemma 4 models (including E2B/E4B multimodal variants)
     # 'paligemma': PaliGemma Vision-Language Models (VLM)
-    gemma_family_types = {"gemma", "gemma2", "gemma3", "paligemma"}
+    gemma_family_types = {"gemma", "gemma2", "gemma3", "gemma4", "paligemma"}
 
     # The check is case-insensitive for robustness
     return model_type.lower() in gemma_family_types

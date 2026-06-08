@@ -7,6 +7,7 @@ import torch
 import yaml
 from pathlib import Path
 from safetensors.torch import load_file, save_file
+from safetensors import safe_open as _safe_open_for_keys  # for low-mem key listing on single-file models
 from tqdm import tqdm
 from transformers import AutoConfig
 from transformers.utils import cached_file
@@ -143,21 +144,23 @@ def ablate_by_layers_sharded(
     projected: bool,
 ) -> None:
     """
-    Memory-efficient ablation for sharded models.
+    Memory-efficient ablation for sharded OR single-file safetensors models.
     Handles both local paths and HuggingFace Hub models.
-    Loads one shard at a time, applies all modifications, then saves.
+    For sharded: loads one shard at a time.
+    For single-file (e.g. gemma-2-2b-it): loads the model weights file once (acceptable for smaller models).
     """
     
     # Load config using transformers (handles both local and HF hub)
     print(f"Loading config for {model_name}...")
     config = AutoConfig.from_pretrained(model_name)
     
-    # Determine precision
-    if hasattr(config, "torch_dtype"):
-        precision = config.torch_dtype
-    elif hasattr(config, "dtype"):
+    # Determine precision (support both legacy torch_dtype and modern dtype)
+    precision = None
+    if hasattr(config, "dtype") and config.dtype is not None:
         precision = config.dtype
-    else:
+    elif hasattr(config, "torch_dtype") and config.torch_dtype is not None:
+        precision = config.torch_dtype
+    if precision is None:
         precision = torch.float32
     
     if isinstance(precision, str):
@@ -170,155 +173,210 @@ def ablate_by_layers_sharded(
     
     print(f"Model precision: {precision}")
     
-    # Get the safetensors index file (handles cache)
-    index_path = cached_file(model_name, "model.safetensors.index.json")
-    model_dir = Path(index_path).parent
-    
-    print(f"Model directory: {model_dir}")
-    
-    with open(index_path) as f:
-        index = json.load(f)
-    
-    weight_map = index["weight_map"]
-    
-    # Find layer prefix
-    layer_prefix = None
-    for key in weight_map.keys():
-        if ".layers." in key and ".self_attn." in key:
-            layer_prefix = key.split(".layers.")[0]
-            print(f"Detected layer prefix: {layer_prefix}")
-            break
-    
-    if layer_prefix is None:
-        raise ValueError("Could not detect layer structure in model weights")
-    
-    # Build a map of which keys in which shards need modification
-    shard_modifications = {}  # shard_file -> [(key, layer, measurement, scale, sparsity)]
-    
+    # Support both sharded (with index.json) and single-file (model.safetensors) models.
+    # Robustly handles multimodal Gemma-4 (gemma-4-E2B-it etc.) which have audio_tower + vision_tower + language_model.
+    print("Locating model weight files (sharded or single safetensors)...")
+    index_path = None
+    weight_map = {}
+    model_dir = None
+    shard_list = []
+    is_sharded = False
+
+    try:
+        index_path = cached_file(model_name, "model.safetensors.index.json")
+        model_dir = Path(index_path).parent
+        with open(index_path) as f:
+            index = json.load(f)
+        weight_map = index["weight_map"]
+        shard_list = sorted(set(weight_map.values()))
+        is_sharded = True
+        print(f"Detected sharded safetensors model ({len(shard_list)} shards)")
+    except Exception:
+        try:
+            single_path = cached_file(model_name, "model.safetensors")
+            model_dir = Path(single_path).parent
+            shard_list = ["model.safetensors"]
+            is_sharded = False
+            print("Detected single-file safetensors model (common for small models)")
+        except Exception as e2:
+            raise RuntimeError(
+                f"Could not locate safetensors weights for '{model_name}'. "
+                "This script supports sharded models (model.safetensors.index.json + shards) "
+                "or single-file model.safetensors. Pre-download the model with "
+                "`huggingface-cli download <model>` if needed. "
+                f"Underlying error: {e2}"
+            ) from e2
+
+    print(f"Model directory (from cache/local): {model_dir}")
+
+    # Detect layer prefix from logical weight keys.
+    # For multimodal models (gemma-4 etc) there may be audio_tower / vision_tower + language_model.
+    # We must prefer the text/language_model backbone for refusal abliteration.
+    def _detect_language_model_prefix(keys):
+        candidates = []
+        for key in keys:
+            if ".layers." in key and ".self_attn." in key:
+                pre = key.split(".layers.")[0]
+                candidates.append(pre)
+        if not candidates:
+            return None
+        # Prefer language / text model backbone
+        for pre in candidates:
+            if "language_model" in pre or "text_model" in pre:
+                return pre
+        # Fallback: first one (old behavior), but warn if it looks like a tower
+        first = candidates[0]
+        if "audio" in first or "vision" in first or "tower" in first:
+            print(f"WARNING: First .self_attn layer prefix was {first!r} (tower?). "
+                  "Falling back to scanning for language_model.")
+            for pre in candidates:
+                if "language_model" in pre or "text_model" in pre:
+                    return pre
+        return first
+
+    if is_sharded:
+        keys_for_detect = list(weight_map.keys())
+    else:
+        # Use safe_open to list keys only — avoids loading several GB of weights just for detection
+        sf_path = str(model_dir / "model.safetensors")
+        with _safe_open_for_keys(sf_path, framework="pt", device="cpu") as f:
+            keys_for_detect = list(f.keys())
+
+    layer_prefix = _detect_language_model_prefix(keys_for_detect)
+    if layer_prefix:
+        print(f"Detected layer prefix: {layer_prefix}")
+    else:
+        raise ValueError("Could not detect layer structure in model weights (looking for .layers.*.self_attn)")
+
+    if layer_prefix and ("audio" in layer_prefix or "vision" in layer_prefix or "tower" in layer_prefix):
+        print("WARNING: Selected prefix looks like a vision/audio tower, not the main language model. "
+              "Refusal abliteration should target the text backbone.")
+
+    # Build map of modifications needed.
+    # shard_modifications: shard_name -> list of tuples for sharded case
+    # target_keys_info: for single-file: key -> (layer, measurement, scale, sparsity)
+    shard_modifications = {}
+    target_keys_info = {}
+
     for layer, measurement, scale, sparsity in marching_orders:
-        # Build the key patterns for this layer
         o_proj_pattern = f"{layer_prefix}.layers.{layer}.self_attn.o_proj.weight"
         down_proj_pattern = f"{layer_prefix}.layers.{layer}.mlp.down_proj.weight"
-        
-        # Find keys that match
-        for key, shard_file in weight_map.items():
-            if key == o_proj_pattern or key == down_proj_pattern:
-                if shard_file not in shard_modifications:
-                    shard_modifications[shard_file] = []
-                shard_modifications[shard_file].append((key, layer, measurement, scale, sparsity))
-    
-    print(f"\nWill modify {len(shard_modifications)} shards out of {len(set(weight_map.values()))} total")
-    
+        for pat in (o_proj_pattern, down_proj_pattern):
+            if is_sharded:
+                if pat in weight_map:
+                    sf = weight_map[pat]
+                    shard_modifications.setdefault(sf, []).append((pat, layer, measurement, scale, sparsity))
+            else:
+                target_keys_info[pat] = (layer, measurement, scale, sparsity)
+
+    if is_sharded:
+        print(f"\nWill modify {len(shard_modifications)} shards (out of {len(shard_list)} total)")
+    else:
+        print(f"\nWill modify up to {len(target_keys_info)} target matrices in the single weights file")
+
     os.makedirs(output_path, exist_ok=True)
-    
-    # Process each shard
-    all_shards = sorted(set(weight_map.values()))
-    
-    for shard_file in tqdm(all_shards, desc="Processing shards"):
+
+    # Process shards / the single file
+    for shard_file in tqdm(shard_list, desc="Processing weight files"):
         shard_path = model_dir / shard_file
-        
-        if shard_file in shard_modifications:
-            print(f"\nLoading and modifying {shard_file}...")
-            
-            # Load the entire shard
-            state_dict = load_file(str(shard_path))
-            
-            # Apply all modifications for this shard
-            for key, layer, measurement, scale, sparsity in shard_modifications[shard_file]:
-                if key in state_dict:
-                    print(f"  Modifying layer {layer}: {key}")
-                    
-                    # Compute refusal direction on-the-fly
-                    refusal_dir = measures[f'refuse_{measurement}'].float()
-                    harmless_dir = measures[f'harmless_{layer}'].float()
-                    
 
-                    if projected:
-                        # Here we orthogonalize refusal with respect to harmless direction.
-                        # We compute the second orthogonalized vector from Gram-Schmitt orthonormalization.
-
-                        # Normalize harmless direction
-                        harmless_normalized = torch.nn.functional.normalize(harmless_dir, dim=0)
-                    
-                        # Project and subtract to refine refusal direction
-                        projection_scalar = refusal_dir @ harmless_normalized
-                        refined_refusal_dir = refusal_dir - projection_scalar * harmless_normalized
-                        refusal_dir = refined_refusal_dir.to(precision)
-                        del harmless_normalized, refined_refusal_dir
-                    
-                    # Apply sparsity
-                    if sparsity > 0.0:
-                        refusal_dir = magnitude_sparsify(refusal_dir, fraction=sparsity)
-                    
-                    # Normalize
-                    refusal_dir = torch.nn.functional.normalize(refusal_dir, dim=-1)
-                    
-                    # Apply modification
-                    if norm_preserve:
-                        state_dict[key] = modify_tensor_norm_preserved(
-                            state_dict[key],
-                            refusal_dir,
-                            scale,
-                        ).contiguous()
-                    else:
-                        state_dict[key] = modify_tensor(
-                            state_dict[key],
-                            refusal_dir,
-                            scale,
-                        ).contiguous()
-                    
-                    # Clean up
-                    del refusal_dir, harmless_dir
-                    gc.collect()
-            
-            # Save modified shard
-            print(f"  Saving {shard_file}...")
-            save_file(state_dict, f"{output_path}/{shard_file}")
-            
-            # Clean up
-            del state_dict
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-        else:
-            # Just copy unmodified shards (no need to load)
+        # For sharded: skip unmodified entirely (zero-RAM copy)
+        if is_sharded and shard_file not in shard_modifications:
             shutil.copy(str(shard_path), f"{output_path}/{shard_file}")
-    
-    # Copy the index file
+            continue
+
+        print(f"\nLoading and modifying {shard_file}...")
+        state_dict = load_file(str(shard_path))
+
+        # Determine which mods apply to this file
+        if is_sharded:
+            current_mods = shard_modifications.get(shard_file, [])
+        else:
+            current_mods = [
+                (key, *target_keys_info[key])
+                for key in state_dict.keys()
+                if key in target_keys_info
+            ]
+
+        for mod_entry in current_mods:
+            key, layer, measurement, scale, sparsity = mod_entry
+            if key not in state_dict:
+                continue
+            print(f"  Modifying layer {layer}: {key}")
+
+            # Compute refusal direction on-the-fly (from precomputed measurements)
+            refusal_dir = measures[f'refuse_{measurement}'].float()
+            harmless_dir = measures[f'harmless_{layer}'].float()
+
+            if projected:
+                # Orthogonalize refusal w.r.t. harmless direction (Gram-Schmidt style)
+                harmless_normalized = torch.nn.functional.normalize(harmless_dir, dim=0)
+                projection_scalar = refusal_dir @ harmless_normalized
+                refined = refusal_dir - projection_scalar * harmless_normalized
+                refusal_dir = refined.to(precision)
+                del harmless_normalized, refined
+
+            # Optional: keep only top-k magnitude components of the direction (sparsity here means keep-fraction)
+            if sparsity > 0.0:
+                refusal_dir = magnitude_sparsify(refusal_dir, fraction=sparsity)
+
+            refusal_dir = torch.nn.functional.normalize(refusal_dir, dim=-1)
+
+            # Core weight edit
+            if norm_preserve:
+                state_dict[key] = modify_tensor_norm_preserved(
+                    state_dict[key], refusal_dir, scale
+                ).contiguous()
+            else:
+                state_dict[key] = modify_tensor(
+                    state_dict[key], refusal_dir, scale
+                ).contiguous()
+
+            del refusal_dir, harmless_dir
+            gc.collect()
+
+        print(f"  Saving {shard_file}...")
+        save_file(state_dict, f"{output_path}/{shard_file}")
+
+        del state_dict
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Copy index only for sharded models
     print("\nCopying configuration files...")
-    shutil.copy(str(index_path), f"{output_path}/model.safetensors.index.json")
-    
-    # Copy all config files that exist
+    if is_sharded and index_path is not None:
+        shutil.copy(str(index_path), f"{output_path}/model.safetensors.index.json")
+
+    # Copy tokenizer / generation / other config files (common to both)
     config_files = [
-        "config.json", 
-        "tokenizer_config.json", 
+        "config.json",
+        "tokenizer_config.json",
         "tokenizer.json",
-        "special_tokens_map.json", 
+        "special_tokens_map.json",
         "generation_config.json",
         "tokenizer.model",
         "vocab.json",
         "merges.txt",
         "added_tokens.json",
         "preprocessor_config.json",
-        "chat_template.json"
+        "chat_template.json",
     ]
-    
+
     for file in config_files:
         try:
             src_path = cached_file(model_name, file)
             if src_path and os.path.exists(src_path):
                 shutil.copy(src_path, f"{output_path}/{file}")
         except Exception:
-            # File doesn't exist, skip it
             pass
-    
+
     print(f"\nModified model saved to {output_path}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Memory-efficient sharded ablation script using YAML configuration."
+        description="Memory-efficient ablation (sharded or single-file safetensors) using YAML configuration."
     )
     
     parser.add_argument(
