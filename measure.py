@@ -134,7 +134,19 @@ def format_chats(
 # ============================================================
 
 def load_conversations(jsonl_path: str):
-    """Stream conversations from a JSONL file. Each line = list of messages."""
+    """Stream conversations from a JSONL file.
+
+    Supports two formats per line:
+    - Message format (standard): JSON list of messages, e.g.
+      [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+      -> yields list[dict]
+    - Text-only format: JSON object with single "text" field (or raw JSON string),
+      e.g. {"text": "the full pre-formatted text here..."}
+      -> yields the str directly.
+
+    When text-only format is detected, the content is assumed to already be
+    chat-templated (or raw text), so no apply_chat_template will be called later.
+    """
     import json
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -142,9 +154,15 @@ def load_conversations(jsonl_path: str):
             if not line:
                 continue
             try:
-                messages = json.loads(line)
-                if isinstance(messages, list) and len(messages) > 0:
-                    yield messages
+                data = json.loads(line)
+                if isinstance(data, dict) and "text" in data:
+                    text = data["text"]
+                    if isinstance(text, str):
+                        yield text
+                elif isinstance(data, list) and len(data) > 0:
+                    yield data
+                elif isinstance(data, str):
+                    yield data
             except Exception:
                 continue
 
@@ -171,7 +189,7 @@ def get_assistant_end_positions(tokenizer, messages: list[dict]) -> list[int]:
 def compute_means_from_conversations(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
-    conversations: list[list[dict]],
+    conversations: list[list[dict] | str],
     desc: str,
     dialogue_batch_size: int = 4,
     max_length: int | None = None,
@@ -183,6 +201,11 @@ def compute_means_from_conversations(
     - Drops any conversation whose tokenized length > max_length.
     - Only updates running Welford means at the last token of each assistant turn.
     - Aggressively clears memory after each micro-batch.
+
+    Supports two conversation formats (mixed ok):
+    - list[dict] : standard messages -> will apply_chat_template
+    - str        : pre-formatted text (only "text" field in jsonl) -> tokenize directly,
+                   no chat template applied, measure at final token.
     """
     from utils.clip import magnitude_clip
 
@@ -200,16 +223,37 @@ def compute_means_from_conversations(
         prepared = []  # (input_ids_list, assistant_positions)
         for convo in batch:
             try:
-                input_ids = tokenizer.apply_chat_template(
-                    convo, tokenize=True, add_generation_prompt=False
-                )
-                if not isinstance(input_ids, list):
-                    continue
-                if max_length is not None and len(input_ids) > max_length:
-                    continue  # drop entire conversation (user requirement)
-                positions = get_assistant_end_positions(tokenizer, convo)
-                if positions:
-                    prepared.append((input_ids, positions))
+                if isinstance(convo, str):
+                    # Text-only format (from {"text": "..."} jsonl): do NOT apply chat template.
+                    # Use the text directly as-is.
+                    encoding = tokenizer(
+                        convo,
+                        add_special_tokens=False,  # text-only: assume the provided text is fully pre-formatted (incl. specials); use directly
+                        return_attention_mask=False,
+                    )
+                    input_ids = encoding["input_ids"]
+                    if isinstance(input_ids, torch.Tensor):
+                        input_ids = input_ids.tolist()
+                    if not isinstance(input_ids, list):
+                        continue
+                    if max_length is not None and len(input_ids) > max_length:
+                        continue  # drop entire conversation
+                    # Measure at the very last token of the provided text
+                    positions = [len(input_ids) - 1] if input_ids else []
+                    if positions:
+                        prepared.append((input_ids, positions))
+                else:
+                    # Message format: apply chat template as before
+                    input_ids = tokenizer.apply_chat_template(
+                        convo, tokenize=True, add_generation_prompt=False
+                    )
+                    if not isinstance(input_ids, list):
+                        continue
+                    if max_length is not None and len(input_ids) > max_length:
+                        continue  # drop entire conversation (user requirement)
+                    positions = get_assistant_end_positions(tokenizer, convo)
+                    if positions:
+                        prepared.append((input_ids, positions))
             except Exception:
                 continue
 
@@ -477,21 +521,24 @@ if __name__ == "__main__":
         help="Path to a previous .refuse / .pt file containing pre-computed 'harmless_*' layer means.",
     )
 
-    # New static conversation mode using full message JSONL (good vs bad behavior)
+    # New static conversation mode using JSONL (good vs bad behavior).
+    # Supports both full messages list format AND text-only {"text": "..."} format (no chat template applied for text-only).
     parser.add_argument(
         "--good-jsonl",
         type=str,
         default=None,
-        help="Path to JSONL file containing good (desired) conversations in messages format. "
-             "Each line should be a JSON array of {'role': ..., 'content': ...}. "
+        help="Path to JSONL file containing good (desired) conversations. "
+             "Supports two formats per line: (1) messages format = JSON array of {'role':..., 'content':...}; "
+             "(2) text-only = JSON object with single 'text' field (the pre-formatted string, chat template NOT applied). "
              "Used as the 'harmless' side in static mode.",
     )
     parser.add_argument(
         "--bad-jsonl",
         type=str,
         default=None,
-        help="Path to JSONL file containing bad (refusing / undesired) conversations in messages format. "
-             "Each line should be a JSON array of {'role': ..., 'content': ...}. "
+        help="Path to JSONL file containing bad (refusing / undesired) conversations. "
+             "Supports two formats per line: (1) messages format = JSON array of {'role':..., 'content':...}; "
+             "(2) text-only = JSON object with single 'text' field (the pre-formatted string, chat template NOT applied). "
              "Used as the 'harmful' side in static mode.",
     )
 
@@ -512,6 +559,7 @@ if __name__ == "__main__":
         print("=== STATIC CONVERSATIONS MODE (good-jsonl vs bad-jsonl, forward only) ===")
         print(f"Good (desired) conversations: {args.good_jsonl}")
         print(f"Bad (refusing) conversations : {args.bad_jsonl}")
+        print("  (auto-detects per-line: messages list OR {'text': ...} ; text-only skips chat template)")
 
         # We still need the model to run forward on the dialogues
         # (but we will load it later in the normal flow or here)
