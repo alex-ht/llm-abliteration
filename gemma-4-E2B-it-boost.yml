@@ -1,0 +1,59 @@
+# Example BOOST-mode config for google/gemma-4-E2B-it
+# Total text layers: 35, hidden_size: 1536
+#
+# Boost mode does NOT edit any weights. It writes a `steering_vectors.pt` sidecar into
+# the output directory (alongside a verbatim copy of the original model files) that
+# steers the residual stream toward the "positive" class at inference time via a
+# forward hook. Only chat.py (or code using utils/steering.py) actually applies it --
+# loading this output directory with plain transformers.from_pretrained() does nothing
+# extra on its own.
+#
+# 1. Run the same measurement step as suppress mode:
+#    python measure.py -m google/gemma-4-E2B-it -o gemma4-e2b-new.direction --batch-size 8 --projected
+#
+# 2. Analyze to pick good source layers (same analyze.py workflow as suppress mode):
+#    python analyze.py gemma4-e2b-new.direction -c
+#
+# 3. Edit this file: which "measurement" layer feeds which target "layer", and `scale`.
+#    Unlike suppress mode, `scale` here is an ABSOLUTE magnitude added to a unit vector,
+#    not a fraction of a projection removed -- start near the printed reference
+#    positive-mean norm for that layer (sharded_ablate.py prints it) and tune from there.
+#
+# 4. Run:
+#    python sharded_ablate.py gemma-4-E2B-it-boost.yml --projected
+#    (--normpreserve is ignored in boost mode, since no weights are modified)
+#
+# 5. Test:
+#    python chat.py -m gemma4-e2b-new-boosted
+#    Try --steer-scale 0 (baseline, no steering) vs 1.0 vs higher to feel out the effect.
+
+model: google/gemma-4-E2B-it
+measurements: gemma4-e2b-new.direction
+output: gemma4-e2b-new-boosted
+mode: boost
+
+ablate:
+  - layer: 11
+    measurement: 13
+    scale: 4.0
+    sparsity: 0.0
+  - layer: 12
+    measurement: 13
+    scale: 4.0
+    sparsity: 0.0
+  - layer: 13
+    measurement: 13
+    scale: 4.0
+    sparsity: 0.0
+  - layer: 14
+    measurement: 13
+    scale: 4.0
+    sparsity: 0.0
+  - layer: 20
+    measurement: 24
+    scale: 4.0
+    sparsity: 0.0
+  - layer: 21
+    measurement: 24
+    scale: 4.0
+    sparsity: 0.0

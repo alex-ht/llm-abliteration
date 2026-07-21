@@ -21,14 +21,14 @@ def scoring_gpu_batched(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
     layer_idx: int,
-    refusal_dir: torch.Tensor,
+    direction: torch.Tensor,
     bias_term: torch.Tensor,
     pos: int = -1,
     batch_size: int = 1,
 ) -> dict:
 
     vocab_size = model.config.vocab_size
-    refusal_dir = refusal_dir.to(model.device)
+    direction = direction.to(model.device)
     bias_term = bias_term.to(model.device)
     scores = []
 
@@ -81,8 +81,8 @@ def scoring_gpu_batched(
         for activation in current_hidden:
             # bias term is flipped from abliteration to classification
             # compliance should score positive
-            # refusal should score negative
-            score = torch.dot(refusal_dir,activation) - bias_term
+            # negative behavior should score negative
+            score = torch.dot(direction,activation) - bias_term
             scores.append(score.item())
 
 #        del gpu_output, batch_input
@@ -95,26 +95,26 @@ def scoring_gpu_batched(
 
 
 def analyze_direction(
-    harmful_mean,
-    harmless_mean,
+    negative_mean,
+    positive_mean,
     layer_idx: int = -1,
 ):
     # 1. Cosine similarity
     cos_sim = torch.nn.functional.cosine_similarity(
-        harmful_mean, harmless_mean, dim=0
+        negative_mean, positive_mean, dim=0
     ).item()
 
     # 2. Magnitudes
-    harmful_norm = harmful_mean.norm().item()
-    harmless_norm = harmless_mean.norm().item()
+    negative_norm = negative_mean.norm().item()
+    positive_norm = positive_mean.norm().item()
 
-    # 3. Refusal direction properties
-    refusal_dir = harmful_mean - harmless_mean
-    refusal_norm = refusal_dir.norm().item()
+    # 3. Direction properties
+    direction = negative_mean - positive_mean
+    direction_norm = direction.norm().item()
 
     # 4. Signal-to-noise ratio
-    # If means are very similar, refusal_dir is small relative to means
-    snr = refusal_norm / max(harmful_norm, harmless_norm)
+    # If means are very similar, direction is small relative to means
+    snr = direction_norm / max(negative_norm, positive_norm)
 
     # 5. Angle between vectors (in degrees)
     angle = torch.acos(torch.clamp(
@@ -124,27 +124,27 @@ def analyze_direction(
     # 6. Signal quality
     quality = snr * (1 - cos_sim)
 
-    print(f"=== Refusal Direction Analysis (Layer {layer_idx}) ===")
+    print(f"=== Direction Analysis (Layer {layer_idx}) ===")
     print(f"Cosine similarity:       {cos_sim:.4f}")
     print(f"Angle between means:     {angle:.2f}°")
-    print(f"Harmful mean norm:       {harmful_norm:.4f}")
-    print(f"Harmless mean norm:      {harmless_norm:.4f}")
-    print(f"Refusal direction norm:  {refusal_norm:.4f}")
+    print(f"Negative mean norm:      {negative_norm:.4f}")
+    print(f"Positive mean norm:      {positive_norm:.4f}")
+    print(f"Direction norm:          {direction_norm:.4f}")
     print(f"Signal-to-noise ratio:   {snr:.4f}")
     print(f"Signal quality:          {quality:.4f}")
 
 
-def score_refusals(
+def score_candidates(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
     candidate_list: list[str],
-    refusal_dir: torch.Tensor,
+    direction: torch.Tensor,
     bias_term: torch.Tensor,
     layer_idx: int = -1,
     inference_batch_size: int = 32,
 ):
 
-    refusal_dir = torch.nn.functional.normalize(refusal_dir, dim=-1)
+    direction = torch.nn.functional.normalize(direction, dim=-1)
     print("Tokenizing inputs")
     candidate_tokens = [
         tokenizer.apply_chat_template(
@@ -162,7 +162,7 @@ def score_refusals(
         layer_idx = int(num_layers * 0.6) # default guesstimate
     pos = -1
 
-    results = scoring_gpu_batched(candidate_tokens, "Generating candidate outputs", model, tokenizer, layer_idx, refusal_dir, bias_term, pos, inference_batch_size)
+    results = scoring_gpu_batched(candidate_tokens, "Generating candidate outputs", model, tokenizer, layer_idx, direction, bias_term, pos, inference_batch_size)
 
     torch.cuda.empty_cache()
     gc.collect()

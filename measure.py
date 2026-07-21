@@ -129,11 +129,11 @@ def format_chats(
     ]
     return result_formatted
 
-def compute_refusals(
+def compute_directions(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
-    harmful_list: list[str],
-    harmless_list: list[str],
+    negative_list: list[str],
+    positive_list: list[str],
     projected: bool = False,
     inference_batch_size: int = 32,
     clip: float = 1.0,
@@ -149,44 +149,44 @@ def compute_refusals(
     # option for layer sweep
     focus_layers = range(num_layers)
 
-    harmful_formatted = format_chats(tokenizer=tokenizer, prompt_list=harmful_list, processor=processor)
-    harmful_means = welford_gpu_batched_multilayer_float32(
-        harmful_formatted, "Generating harmful outputs", model, tokenizer, 
+    negative_formatted = format_chats(tokenizer=tokenizer, prompt_list=negative_list, processor=processor)
+    negative_means = welford_gpu_batched_multilayer_float32(
+        negative_formatted, "Generating negative outputs", model, tokenizer,
         focus_layers, pos, inference_batch_size, clip, processor, is_vision_model
     )
     torch.cuda.empty_cache()
-    del harmful_formatted
-    harmless_formatted = format_chats(tokenizer=tokenizer, prompt_list=harmless_list, processor=processor)
-    harmless_means = welford_gpu_batched_multilayer_float32(
-        harmless_formatted, "Generating harmless outputs", model, tokenizer, 
+    del negative_formatted
+    positive_formatted = format_chats(tokenizer=tokenizer, prompt_list=positive_list, processor=processor)
+    positive_means = welford_gpu_batched_multilayer_float32(
+        positive_formatted, "Generating positive outputs", model, tokenizer,
         focus_layers, pos, inference_batch_size, clip, processor, is_vision_model
     )
-    del harmless_formatted
+    del positive_formatted
 
     results = {}
     results["layers"] = num_layers
 
     # Keep all results in 32-bit float for analysis/ablation
     for layer in tqdm(focus_layers,desc="Compiling layer measurements"):
-        harmful_mean = harmful_means[layer]
-        results[f'harmful_{layer}'] = harmful_mean
-        harmless_mean = harmless_means[layer]
-        results[f'harmless_{layer}'] = harmless_mean
-        refusal_dir = harmful_mean - harmless_mean
+        negative_mean = negative_means[layer]
+        results[f'negative_{layer}'] = negative_mean
+        positive_mean = positive_means[layer]
+        results[f'positive_{layer}'] = positive_mean
+        direction = negative_mean - positive_mean
 
         if projected:
-            # Compute Gram-Schmidt second orthogonal vector/direction to remove harmless direction interference from refusal direction
-            # Normalize harmless_mean to avoid numerical issues in projection calculation
-            harmless_normalized = torch.nn.functional.normalize(harmless_mean.float(), dim=0)
+            # Compute Gram-Schmidt second orthogonal vector/direction to remove positive direction interference from the direction
+            # Normalize positive_mean to avoid numerical issues in projection calculation
+            positive_normalized = torch.nn.functional.normalize(positive_mean.float(), dim=0)
 
-            # Project and subtract contribution along harmless direction
-            projection_scalar = refusal_dir @ harmless_normalized
+            # Project and subtract contribution along positive direction
+            projection_scalar = direction @ positive_normalized
 
-            # Resulting refusal direction should minimize impact along harmless direction
-            refusal_dir = refusal_dir - projection_scalar * harmless_normalized
-        # otherwise default to stock abliteration refusal direction calculation
+            # Resulting direction should minimize impact along positive direction
+            direction = direction - projection_scalar * positive_normalized
+        # otherwise default to stock abliteration direction calculation
 
-        results[f'refuse_{layer}'] = refusal_dir
+        results[f'direction_{layer}'] = direction
 
     torch.cuda.empty_cache()
     gc.collect()
@@ -234,28 +234,28 @@ if __name__ == "__main__":
         help="Use Flash Attention 2"
     )
     parser.add_argument(
-        "--data-harmful",
+        "--data-negative",
         type=str,
         default=None,
-        help="Harmful prompts file"
+        help="Negative-class prompts file (the behavior/style you want to suppress or steer away from)"
     )
     parser.add_argument(
-        "--data-harmless",
+        "--data-positive",
         type=str,
         default=None,
-        help="Harmless prompts file"
+        help="Positive-class prompts file (the behavior/style you want to keep or steer toward)"
     )
     parser.add_argument(
         "--deccp",
         action="store_true",
         default=False,
-        help="For Chinese models, add topics to harmful prompts",
+        help="For Chinese models, add topics to the negative prompt set",
     )
     parser.add_argument(
         "--projected",
         action="store_true",
         default=False,
-        help="Remove projection along harmless direction from refusal direction",
+        help="Remove projection along positive direction from the computed direction",
     )
 
     args = parser.parse_args()
@@ -338,18 +338,18 @@ if __name__ == "__main__":
 #            llm_int8_has_fp16_weight=True,
         )    
 
-    if isinstance(args.data_harmful, str):
-        harmful_list = load_data(args.data_harmful)
+    if isinstance(args.data_negative, str):
+        negative_list = load_data(args.data_negative)
     else:
-        harmful_list = load_data("./data/harmful.parquet")
-    if isinstance(args.data_harmless, str):
-        harmless_list = load_data(args.data_harmless)
+        negative_list = load_data("./data/negative.parquet")
+    if isinstance(args.data_positive, str):
+        positive_list = load_data(args.data_positive)
     else:
-        harmless_list = load_data("./data/harmless.parquet")
+        positive_list = load_data("./data/positive.parquet")
 
     if args.deccp:
         deccp_list = load_dataset("augmxnt/deccp", split="censored")
-        harmful_list += deccp_list["text"]
+        negative_list += deccp_list["text"]
 
     # Assume "cuda" device for now; refactor later if there's demand for other GPU-accelerated platforms
     if hasattr(model_config, "quantization_config"):
@@ -409,12 +409,12 @@ if __name__ == "__main__":
             padding=True,
         )
 
-    print("Computing refusal information...")
+    print("Computing direction information...")
     results = {}
-    results = compute_refusals(
-        model, tokenizer, harmful_list, harmless_list,
+    results = compute_directions(
+        model, tokenizer, negative_list, positive_list,
         args.projected, args.batch_size, args.clip, processor, has_vision
     )
 
-    print(f"Saving refusal information to {args.output}...")
+    print(f"Saving direction information to {args.output}...")
     torch.save(results, args.output)

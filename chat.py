@@ -5,7 +5,9 @@ from transformers import (
     BitsAndBytesConfig,
 )
 from argparse import ArgumentParser
+import os
 import torch
+from utils.steering import load_steering_vectors, install_steering_hooks
 
 parser = ArgumentParser()
 parser.add_argument(
@@ -46,6 +48,19 @@ quant.add_argument(
 parser.add_argument(
     "--flash-attn", action="store_true", default=False, help="Use flash attention 2"
 )
+parser.add_argument(
+    "--steering-vectors",
+    type=str,
+    default=None,
+    help="Path to a steering_vectors.pt sidecar (boost mode). Defaults to "
+    "<model>/steering_vectors.pt if present.",
+)
+parser.add_argument(
+    "--steer-scale",
+    type=float,
+    default=1.0,
+    help="Global multiplier applied over every loaded steering entry's scale",
+)
 args = parser.parse_args()
 
 
@@ -85,6 +100,20 @@ if __name__ == "__main__":
         args.model, trust_remote_code=True, device_map=args.device
     )
 
+    steering_path = args.steering_vectors or os.path.join(args.model, "steering_vectors.pt")
+    if os.path.isfile(steering_path):
+        steering_data = load_steering_vectors(steering_path)
+        entries = steering_data["entries"]
+        install_steering_hooks(model, entries, global_scale=args.steer_scale)
+        print(f"! Loaded {len(entries)} steering vector(s) from {steering_path} (global scale x{args.steer_scale}):")
+        for entry in entries:
+            print(
+                f"    layer {entry['layer']}: scale={entry['scale'] * args.steer_scale:.3f} "
+                f"(ref_norm={entry.get('ref_norm', float('nan')):.2f})"
+            )
+    elif args.steering_vectors is not None:
+        raise FileNotFoundError(f"--steering-vectors path not found: {args.steering_vectors}")
+
     conversation = []
     streamer = TextStreamer(tokenizer)
     print("Type /clear to clear history, /exit to quit.")
@@ -103,6 +132,9 @@ if __name__ == "__main__":
         toks = tokenizer.apply_chat_template(
             conversation=conversation, add_generation_prompt=True, return_tensors="pt"
         )
+        if not torch.is_tensor(toks):
+            # Some chat templates (e.g. gemma-4) return a BatchEncoding instead of a bare tensor
+            toks = toks["input_ids"]
         gen = model.generate(
             toks.to(model.device), streamer=streamer, max_new_tokens=args.max_new_tokens
         )

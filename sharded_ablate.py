@@ -20,7 +20,7 @@ def magnitude_sparsify(tensor: torch.Tensor, fraction: float) -> torch.Tensor:
     k = int(tensor.numel() * fraction)
     if k == 0:
         return torch.zeros_like(tensor)
-    
+
     flat = tensor.flatten()
     threshold = torch.topk(flat.abs(), k, largest=True, sorted=False)[0].min()
     mask = tensor.abs() >= threshold
@@ -34,12 +34,12 @@ PyTorch nn.Linear layers store weights as [out_features, in_features] - each row
 Safetensors (HuggingFace format) stores them as [in_features, out_features] - transposed!
 """
 
-# standard ablation
+# standard ablation (suppress mode)
 def modify_tensor(
-    W: torch.Tensor, refusal_dir: torch.Tensor, scale_factor: float = 1.0,
+    W: torch.Tensor, direction: torch.Tensor, scale_factor: float = 1.0,
 ) -> torch.Tensor:
     """
-    Modify weight tensor by ablating refusal direction while preserving row norms.
+    Modify weight tensor by ablating the given direction while preserving row norms.
     Returns a plain tensor (not a Parameter).
     """
     original_dtype = W.dtype
@@ -49,29 +49,29 @@ def modify_tensor(
         # Move tensors for computation
         # Transpose here to convert from safetensors convention
         W_gpu = W.to(device, dtype=torch.float32, non_blocking=True).T
-        refusal_dir_gpu = refusal_dir.to(device, dtype=torch.float32, non_blocking=True)
+        direction_gpu = direction.to(device, dtype=torch.float32, non_blocking=True)
 
-        # Ensure refusal_dir is a 1-dimensional tensor
-        if refusal_dir_gpu.dim() > 1:
-            refusal_dir_gpu = refusal_dir_gpu.view(-1)
-        
-        # Normalize refusal direction
-        refusal_normalized = torch.nn.functional.normalize(refusal_dir_gpu, dim=0)
+        # Ensure direction is a 1-dimensional tensor
+        if direction_gpu.dim() > 1:
+            direction_gpu = direction_gpu.view(-1)
 
-        # Apply abliteration
-        # Compute dot product of each row with refusal direction
-        projection = torch.matmul(W_gpu, refusal_normalized)  # [in_features]
-        
+        # Normalize direction
+        direction_normalized = torch.nn.functional.normalize(direction_gpu, dim=0)
+
+        # Apply ablation
+        # Compute dot product of each row with the direction
+        projection = torch.matmul(W_gpu, direction_normalized)  # [in_features]
+
         # Subtract the projection
-        W_gpu -= scale_factor * torch.outer(projection, refusal_normalized)
-        
+        W_gpu -= scale_factor * torch.outer(projection, direction_normalized)
+
         # Convert back to original dtype and CPU
         # Transpose here to return safetensors convention
         result = W_gpu.T.to('cpu', dtype=original_dtype, non_blocking=True)
 
         # Cleanup
-        del W_gpu, refusal_dir_gpu, refusal_normalized, projection
-        
+        del W_gpu, direction_gpu, direction_normalized, projection
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -80,10 +80,10 @@ def modify_tensor(
 
 
 def modify_tensor_norm_preserved(
-    W: torch.Tensor, refusal_dir: torch.Tensor, scale_factor: float = 1.0,
+    W: torch.Tensor, direction: torch.Tensor, scale_factor: float = 1.0,
 ) -> torch.Tensor:
     """
-    Modify weight tensor by ablating refusal direction while preserving row norms.
+    Modify weight tensor by ablating the given direction while preserving row norms.
     Returns a plain tensor (not a Parameter).
     """
     original_dtype = W.dtype
@@ -93,46 +93,157 @@ def modify_tensor_norm_preserved(
         # Move tensors for computation
         # Transpose here to convert from safetensors convention
         W_gpu = W.to(device, dtype=torch.float32, non_blocking=True).T
-        refusal_dir_gpu = refusal_dir.to(device, dtype=torch.float32, non_blocking=True)
+        direction_gpu = direction.to(device, dtype=torch.float32, non_blocking=True)
 
-        # Ensure refusal_dir is a 1-dimensional tensor
-        if refusal_dir_gpu.dim() > 1:
-            refusal_dir_gpu = refusal_dir_gpu.view(-1)
-        
-        # Normalize refusal direction
-        refusal_normalized = torch.nn.functional.normalize(refusal_dir_gpu, dim=0)
+        # Ensure direction is a 1-dimensional tensor
+        if direction_gpu.dim() > 1:
+            direction_gpu = direction_gpu.view(-1)
+
+        # Normalize direction
+        direction_normalized = torch.nn.functional.normalize(direction_gpu, dim=0)
 
         # Decompose weight matrix
         # W_gpu is [out_features, in_features]
         W_norm = torch.norm(W_gpu, dim=1, keepdim=True)  # [out_features, 1]
         W_direction = torch.nn.functional.normalize(W_gpu, dim=1)  # normalized per output neuron
-    
-        # Apply abliteration to the DIRECTIONAL component
-        # Compute dot product of each row with refusal direction
-        projection = torch.matmul(W_direction, refusal_normalized)  # [in_features]
-        
+
+        # Apply ablation to the DIRECTIONAL component
+        # Compute dot product of each row with the direction
+        projection = torch.matmul(W_direction, direction_normalized)  # [in_features]
+
         # Subtract the projection
-        W_direction_new = W_direction - scale_factor * torch.outer(projection, refusal_normalized)
-    
+        W_direction_new = W_direction - scale_factor * torch.outer(projection, direction_normalized)
+
         # Re-normalize the adjusted direction
         W_direction_new = torch.nn.functional.normalize(W_direction_new, dim=1)
-    
+
         # Recombine: keep original magnitude, use new direction
         W_modified = W_norm * W_direction_new
-        
+
         # Convert back to original dtype and CPU
         # Transpose here to return safetensors convention
         result = W_modified.T.to('cpu', dtype=original_dtype, non_blocking=True)
 
         # Cleanup
-        del W_gpu, refusal_dir_gpu, refusal_normalized, projection
+        del W_gpu, direction_gpu, direction_normalized, projection
         del W_direction, W_direction_new, W_norm, W_modified
-        
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
     return result.detach().clone()
+
+
+def _resolve_precision(config) -> torch.dtype:
+    """Determine model precision/dtype from a HF config, with legacy torch_dtype fallback."""
+    precision = None
+    if hasattr(config, "dtype") and config.dtype is not None:
+        precision = config.dtype
+    elif hasattr(config, "torch_dtype") and config.torch_dtype is not None:
+        precision = config.torch_dtype
+    if precision is None:
+        precision = torch.float32
+
+    if isinstance(precision, str):
+        precision_map = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        precision = precision_map.get(precision, torch.float32)
+
+    return precision
+
+
+def _locate_weight_files(model_name: str):
+    """
+    Locate sharded (index.json + shards) or single-file safetensors weights for a model.
+    Handles both local paths and HuggingFace Hub models.
+    Returns (model_dir, shard_list, is_sharded, weight_map, index_path).
+    """
+    print("Locating model weight files (sharded or single safetensors)...")
+    try:
+        index_path = cached_file(model_name, "model.safetensors.index.json")
+        model_dir = Path(index_path).parent
+        with open(index_path) as f:
+            index = json.load(f)
+        weight_map = index["weight_map"]
+        shard_list = sorted(set(weight_map.values()))
+        print(f"Detected sharded safetensors model ({len(shard_list)} shards)")
+        return model_dir, shard_list, True, weight_map, index_path
+    except Exception:
+        try:
+            single_path = cached_file(model_name, "model.safetensors")
+            model_dir = Path(single_path).parent
+            print("Detected single-file safetensors model (common for small models)")
+            return model_dir, ["model.safetensors"], False, {}, None
+        except Exception as e2:
+            raise RuntimeError(
+                f"Could not locate safetensors weights for '{model_name}'. "
+                "This script supports sharded models (model.safetensors.index.json + shards) "
+                "or single-file model.safetensors. Pre-download the model with "
+                "`huggingface-cli download <model>` if needed. "
+                f"Underlying error: {e2}"
+            ) from e2
+
+
+def _detect_language_model_prefix(keys):
+    """
+    Detect layer prefix from logical weight keys.
+    For multimodal models (gemma-4 etc) there may be audio_tower / vision_tower + language_model.
+    We must prefer the text/language_model backbone for direction-based editing.
+    """
+    candidates = []
+    for key in keys:
+        if ".layers." in key and ".self_attn." in key:
+            pre = key.split(".layers.")[0]
+            candidates.append(pre)
+    if not candidates:
+        return None
+    # Prefer language / text model backbone
+    for pre in candidates:
+        if "language_model" in pre or "text_model" in pre:
+            return pre
+    # Fallback: first one (old behavior), but warn if it looks like a tower
+    first = candidates[0]
+    if "audio" in first or "vision" in first or "tower" in first:
+        print(f"WARNING: First .self_attn layer prefix was {first!r} (tower?). "
+              "Falling back to scanning for language_model.")
+        for pre in candidates:
+            if "language_model" in pre or "text_model" in pre:
+                return pre
+    return first
+
+
+def _copy_ancillary_files(model_name: str, output_path: str, is_sharded: bool, index_path) -> None:
+    """Copy the safetensors index (if sharded) plus tokenizer/config/generation files."""
+    print("\nCopying configuration files...")
+    if is_sharded and index_path is not None:
+        shutil.copy(str(index_path), f"{output_path}/model.safetensors.index.json")
+
+    config_files = [
+        "config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "special_tokens_map.json",
+        "generation_config.json",
+        "tokenizer.model",
+        "vocab.json",
+        "merges.txt",
+        "added_tokens.json",
+        "preprocessor_config.json",
+        "chat_template.json",
+        "chat_template.jinja",
+    ]
+
+    for file in config_files:
+        try:
+            src_path = cached_file(model_name, file)
+            if src_path and os.path.exists(src_path):
+                shutil.copy(src_path, f"{output_path}/{file}")
+        except Exception:
+            pass
 
 
 def ablate_by_layers_sharded(
@@ -144,95 +255,18 @@ def ablate_by_layers_sharded(
     projected: bool,
 ) -> None:
     """
-    Memory-efficient ablation for sharded OR single-file safetensors models.
-    Handles both local paths and HuggingFace Hub models.
+    Suppress mode: memory-efficient permanent weight ablation for sharded OR single-file
+    safetensors models. Handles both local paths and HuggingFace Hub models.
     For sharded: loads one shard at a time.
     For single-file (e.g. gemma-2-2b-it): loads the model weights file once (acceptable for smaller models).
     """
-    
-    # Load config using transformers (handles both local and HF hub)
     print(f"Loading config for {model_name}...")
     config = AutoConfig.from_pretrained(model_name)
-    
-    # Determine precision (support both legacy torch_dtype and modern dtype)
-    precision = None
-    if hasattr(config, "dtype") and config.dtype is not None:
-        precision = config.dtype
-    elif hasattr(config, "torch_dtype") and config.torch_dtype is not None:
-        precision = config.torch_dtype
-    if precision is None:
-        precision = torch.float32
-    
-    if isinstance(precision, str):
-        precision_map = {
-            "float32": torch.float32,
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-        }
-        precision = precision_map.get(precision, torch.float32)
-    
+    precision = _resolve_precision(config)
     print(f"Model precision: {precision}")
-    
-    # Support both sharded (with index.json) and single-file (model.safetensors) models.
-    # Robustly handles multimodal Gemma-4 (gemma-4-E2B-it etc.) which have audio_tower + vision_tower + language_model.
-    print("Locating model weight files (sharded or single safetensors)...")
-    index_path = None
-    weight_map = {}
-    model_dir = None
-    shard_list = []
-    is_sharded = False
 
-    try:
-        index_path = cached_file(model_name, "model.safetensors.index.json")
-        model_dir = Path(index_path).parent
-        with open(index_path) as f:
-            index = json.load(f)
-        weight_map = index["weight_map"]
-        shard_list = sorted(set(weight_map.values()))
-        is_sharded = True
-        print(f"Detected sharded safetensors model ({len(shard_list)} shards)")
-    except Exception:
-        try:
-            single_path = cached_file(model_name, "model.safetensors")
-            model_dir = Path(single_path).parent
-            shard_list = ["model.safetensors"]
-            is_sharded = False
-            print("Detected single-file safetensors model (common for small models)")
-        except Exception as e2:
-            raise RuntimeError(
-                f"Could not locate safetensors weights for '{model_name}'. "
-                "This script supports sharded models (model.safetensors.index.json + shards) "
-                "or single-file model.safetensors. Pre-download the model with "
-                "`huggingface-cli download <model>` if needed. "
-                f"Underlying error: {e2}"
-            ) from e2
-
+    model_dir, shard_list, is_sharded, weight_map, index_path = _locate_weight_files(model_name)
     print(f"Model directory (from cache/local): {model_dir}")
-
-    # Detect layer prefix from logical weight keys.
-    # For multimodal models (gemma-4 etc) there may be audio_tower / vision_tower + language_model.
-    # We must prefer the text/language_model backbone for refusal abliteration.
-    def _detect_language_model_prefix(keys):
-        candidates = []
-        for key in keys:
-            if ".layers." in key and ".self_attn." in key:
-                pre = key.split(".layers.")[0]
-                candidates.append(pre)
-        if not candidates:
-            return None
-        # Prefer language / text model backbone
-        for pre in candidates:
-            if "language_model" in pre or "text_model" in pre:
-                return pre
-        # Fallback: first one (old behavior), but warn if it looks like a tower
-        first = candidates[0]
-        if "audio" in first or "vision" in first or "tower" in first:
-            print(f"WARNING: First .self_attn layer prefix was {first!r} (tower?). "
-                  "Falling back to scanning for language_model.")
-            for pre in candidates:
-                if "language_model" in pre or "text_model" in pre:
-                    return pre
-        return first
 
     if is_sharded:
         keys_for_detect = list(weight_map.keys())
@@ -250,7 +284,7 @@ def ablate_by_layers_sharded(
 
     if layer_prefix and ("audio" in layer_prefix or "vision" in layer_prefix or "tower" in layer_prefix):
         print("WARNING: Selected prefix looks like a vision/audio tower, not the main language model. "
-              "Refusal abliteration should target the text backbone.")
+              "Direction-based editing should target the text backbone.")
 
     # Build map of modifications needed.
     # shard_modifications: shard_name -> list of tuples for sharded case
@@ -280,10 +314,15 @@ def ablate_by_layers_sharded(
     for shard_file in tqdm(shard_list, desc="Processing weight files"):
         shard_path = model_dir / shard_file
 
-        # For sharded: skip unmodified entirely (zero-RAM copy)
-        if is_sharded and shard_file not in shard_modifications:
-            shutil.copy(str(shard_path), f"{output_path}/{shard_file}")
-            continue
+        # Skip entirely (zero-RAM copy) when nothing in this file needs modification.
+        if is_sharded:
+            if shard_file not in shard_modifications:
+                shutil.copy(str(shard_path), f"{output_path}/{shard_file}")
+                continue
+        else:
+            if not target_keys_info:
+                shutil.copy(str(shard_path), f"{output_path}/{shard_file}")
+                continue
 
         print(f"\nLoading and modifying {shard_file}...")
         state_dict = load_file(str(shard_path))
@@ -304,35 +343,35 @@ def ablate_by_layers_sharded(
                 continue
             print(f"  Modifying layer {layer}: {key}")
 
-            # Compute refusal direction on-the-fly (from precomputed measurements)
-            refusal_dir = measures[f'refuse_{measurement}'].float()
-            harmless_dir = measures[f'harmless_{layer}'].float()
+            # Direction to suppress, computed on-the-fly from precomputed measurements
+            direction = measures[f'direction_{measurement}'].float()
+            positive_dir = measures[f'positive_{layer}'].float()
 
             if projected:
-                # Orthogonalize refusal w.r.t. harmless direction (Gram-Schmidt style)
-                harmless_normalized = torch.nn.functional.normalize(harmless_dir, dim=0)
-                projection_scalar = refusal_dir @ harmless_normalized
-                refined = refusal_dir - projection_scalar * harmless_normalized
-                refusal_dir = refined.to(precision)
-                del harmless_normalized, refined
+                # Orthogonalize direction w.r.t. positive direction (Gram-Schmidt style)
+                positive_normalized = torch.nn.functional.normalize(positive_dir, dim=0)
+                projection_scalar = direction @ positive_normalized
+                refined = direction - projection_scalar * positive_normalized
+                direction = refined.to(precision)
+                del positive_normalized, refined
 
             # Optional: keep only top-k magnitude components of the direction (sparsity here means keep-fraction)
             if sparsity > 0.0:
-                refusal_dir = magnitude_sparsify(refusal_dir, fraction=sparsity)
+                direction = magnitude_sparsify(direction, fraction=sparsity)
 
-            refusal_dir = torch.nn.functional.normalize(refusal_dir, dim=-1)
+            direction = torch.nn.functional.normalize(direction, dim=-1)
 
             # Core weight edit
             if norm_preserve:
                 state_dict[key] = modify_tensor_norm_preserved(
-                    state_dict[key], refusal_dir, scale
+                    state_dict[key], direction, scale
                 ).contiguous()
             else:
                 state_dict[key] = modify_tensor(
-                    state_dict[key], refusal_dir, scale
+                    state_dict[key], direction, scale
                 ).contiguous()
 
-            del refusal_dir, harmless_dir
+            del direction, positive_dir
             gc.collect()
 
         print(f"  Saving {shard_file}...")
@@ -343,42 +382,100 @@ def ablate_by_layers_sharded(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # Copy index only for sharded models
-    print("\nCopying configuration files...")
-    if is_sharded and index_path is not None:
-        shutil.copy(str(index_path), f"{output_path}/model.safetensors.index.json")
-
-    # Copy tokenizer / generation / other config files (common to both)
-    config_files = [
-        "config.json",
-        "tokenizer_config.json",
-        "tokenizer.json",
-        "special_tokens_map.json",
-        "generation_config.json",
-        "tokenizer.model",
-        "vocab.json",
-        "merges.txt",
-        "added_tokens.json",
-        "preprocessor_config.json",
-        "chat_template.json",
-    ]
-
-    for file in config_files:
-        try:
-            src_path = cached_file(model_name, file)
-            if src_path and os.path.exists(src_path):
-                shutil.copy(src_path, f"{output_path}/{file}")
-        except Exception:
-            pass
+    _copy_ancillary_files(model_name, output_path, is_sharded, index_path)
 
     print(f"\nModified model saved to {output_path}")
 
 
+def write_steering_vectors_sharded(
+    model_name: str,
+    measures: dict,
+    marching_orders: list,
+    output_path: str,
+    projected: bool,
+) -> None:
+    """
+    Boost mode: verbatim-copies the model's weights (no tensor is modified) and writes
+    a `steering_vectors.pt` sidecar with a unit direction + scale per target layer.
+
+    o_proj/down_proj have no bias term in Llama/Gemma/Mistral/Qwen-style architectures,
+    so a constant offset cannot be permanently baked into the weight matrices the way
+    suppress mode's ablation can. Instead, steering is applied at inference time via a
+    forward hook on the residual stream (see utils/steering.py) that adds
+    `scale * unit_vector` to the target decoder layer's output on every forward pass.
+    """
+    print(f"Loading config for {model_name}...")
+    config = AutoConfig.from_pretrained(model_name)
+    precision = _resolve_precision(config)
+    print(f"Model precision: {precision}")
+
+    model_dir, shard_list, is_sharded, weight_map, index_path = _locate_weight_files(model_name)
+    print(f"Model directory (from cache/local): {model_dir}")
+
+    os.makedirs(output_path, exist_ok=True)
+
+    print(f"\nCopying {len(shard_list)} weight file(s) verbatim (boost mode does not modify weights)...")
+    for shard_file in tqdm(shard_list, desc="Copying weight files"):
+        shutil.copy(str(model_dir / shard_file), f"{output_path}/{shard_file}")
+
+    entries = []
+    for layer, measurement, scale, sparsity in marching_orders:
+        direction = measures[f'direction_{measurement}'].float()
+        # The stored direction points toward "negative"; boosting means steering the
+        # opposite way, toward "positive".
+        boost_dir = -direction
+
+        if projected:
+            # Orthogonalize against the *target* layer's negative mean — the mirror
+            # image of suppress mode's orthogonalization against the positive mean.
+            negative_dir = measures[f'negative_{layer}'].float()
+            negative_normalized = torch.nn.functional.normalize(negative_dir, dim=0)
+            projection_scalar = boost_dir @ negative_normalized
+            boost_dir = boost_dir - projection_scalar * negative_normalized
+            del negative_dir, negative_normalized
+
+        if sparsity > 0.0:
+            boost_dir = magnitude_sparsify(boost_dir, fraction=sparsity)
+
+        boost_dir = torch.nn.functional.normalize(boost_dir, dim=-1)
+
+        ref_norm = measures[f'positive_{layer}'].float().norm().item()
+        print(
+            f"  Layer {layer}: measurement={measurement}, scale={scale}, sparsity={sparsity} "
+            f"(reference positive-mean norm at this layer: {ref_norm:.2f} -- pick `scale` relative to this)"
+        )
+
+        entries.append({
+            "layer": layer,
+            "scale": scale,
+            "vector": boost_dir.contiguous(),
+            "measurement": measurement,
+            "sparsity": sparsity,
+            "ref_norm": ref_norm,
+        })
+
+    steering_file = f"{output_path}/steering_vectors.pt"
+    print(f"\nSaving steering vectors to {steering_file}...")
+    torch.save({"entries": entries}, steering_file)
+
+    _copy_ancillary_files(model_name, output_path, is_sharded, index_path)
+
+    print(f"\nBoost-mode model directory saved to {output_path}")
+    print(
+        "NOTE: weights in this directory are UNCHANGED from the source model. Steering "
+        "only takes effect when steering_vectors.pt is loaded and its hooks are "
+        "installed at inference time (see chat.py or utils/steering.py) -- plain "
+        "transformers `from_pretrained()` on this directory alone applies no steering."
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Memory-efficient ablation (sharded or single-file safetensors) using YAML configuration."
+        description="Memory-efficient direction editing (sharded or single-file safetensors) using YAML "
+                     "configuration. Supports two modes: 'suppress' (permanent weight ablation) and "
+                     "'boost' (runtime activation steering)."
     )
-    
+
     parser.add_argument(
         'file_path',
         type=str,
@@ -388,43 +485,48 @@ def main():
         '--normpreserve',
         action="store_true",
         default=False,
-        help='Preserve norms/magnitudes when ablating refusal',
+        help='Preserve norms/magnitudes when ablating (suppress mode only; ignored in boost mode)',
     )
     parser.add_argument(
         '--projected',
         action="store_true",
         default=False,
-        help='Project refusal against harmless direction and orthogonalize',
+        help='Orthogonalize the direction against the opposite class mean before applying it',
     )
-    
+
     args = parser.parse_args()
-    
+
     # Load YAML configuration
     with open(args.file_path, 'r') as file:
         ydata = yaml.safe_load(file)
-    
+
     model_name = ydata.get("model")
     measurement_file = ydata.get("measurements")
     output_dir = ydata.get("output")
     ablations = ydata.get("ablate")
-    
+    mode = ydata.get("mode", "suppress")
+
+    if mode not in ("suppress", "boost"):
+        raise ValueError(f"Unknown mode '{mode}' in YAML config; expected 'suppress' or 'boost'")
+
     print("=" * 60)
-    print("SHARDED ABLATION CONFIGURATION")
+    print("DIRECTION EDITING CONFIGURATION")
     print("=" * 60)
     print(f"Model: {model_name}")
     print(f"Measurements: {measurement_file}")
     print(f"Output directory: {output_dir}")
-    print(f"Number of ablations: {len(ablations)}")
+    print(f"Mode: {mode}")
+    print(f"Number of entries: {len(ablations)}")
     print(f"Norm preservation: {args.normpreserve}")
     print(f"Projected: {args.projected}")
     print("=" * 60)
-    
+
     # Load measurements
     print(f"\nLoading measurements from {measurement_file}...")
     measures = torch.load(measurement_file)
     print(f"Loaded {len(measures)} measurements")
-    
-    # Parse ablation orders
+
+    # Parse entries
     orders = [
         (
             int(item['layer']),
@@ -434,26 +536,37 @@ def main():
         )
         for item in ablations
     ]
-    
-    print("\nAblation orders:")
+
+    print("\nEntries:")
     for layer, measurement, scale, sparsity in orders:
         print(f"  Layer {layer}: measurement={measurement}, scale={scale}, sparsity={sparsity}")
-    
-    # Perform sharded ablation
+
     print("\n" + "=" * 60)
-    print("STARTING ABLATION")
+    print(f"STARTING {mode.upper()}")
     print("=" * 60)
-    ablate_by_layers_sharded(
-        model_name=model_name,
-        measures=measures,
-        marching_orders=orders,
-        output_path=output_dir,
-        norm_preserve=args.normpreserve,
-        projected=args.projected,
-    )
-    
+
+    if mode == "suppress":
+        ablate_by_layers_sharded(
+            model_name=model_name,
+            measures=measures,
+            marching_orders=orders,
+            output_path=output_dir,
+            norm_preserve=args.normpreserve,
+            projected=args.projected,
+        )
+    else:
+        if args.normpreserve:
+            print("Warning: --normpreserve has no effect in boost mode (no weights are modified); ignoring.")
+        write_steering_vectors_sharded(
+            model_name=model_name,
+            measures=measures,
+            marching_orders=orders,
+            output_path=output_dir,
+            projected=args.projected,
+        )
+
     print("\n" + "=" * 60)
-    print("ABLATION COMPLETE")
+    print("DONE")
     print("=" * 60)
 
 

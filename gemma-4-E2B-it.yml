@@ -21,7 +21,7 @@
 #
 # Notes:
 # - We only modify layers under model.language_model (vision/audio towers are left untouched).
-# - For VLMs, measurement uses text chat templates only (pure text harmful/harmless data).
+# - For VLMs, measurement uses text chat templates only (pure text negative/positive data).
 # - Output will be a full copy of the model dir with modified weights.
 
 model: google/gemma-4-E2B-it
